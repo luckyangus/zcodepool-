@@ -67,9 +67,30 @@ Z·POOL 是一个基于 Tauri 2 的桌面工具，把 ZCode / Z.ai 的多账号�
 
 ### 邮箱池
 
-- 导入 `email----password----client_id----refresh_token` 格式的账号文件，读取 Outlook / Hotmail 验证邮件。
-- 批量完成注册、取信、验证与授权流程；滑块验证码需手动完成。
+- **任意邮箱**：导入 `email:password` 即可，IMAP 服务器**自动寻址**（已知服务商映射 → 逐级上溯父域 → 常见前缀探测）。
+  例如 `kei_kun@po4.ueda.ne.jp` 会自动命中 `mail.ueda.ne.jp:993`——注意真实服务器挂在**父域**上，
+  只拼 `imap.<收件域>` 的做法在这类邮箱上会全部失败。
+- **Outlook**：导入 `email----password----client_id----refresh_token`，走 Microsoft Graph。
+- 需要显式指定服务器时用 `email----password----imap_host----imap_port`。
+- 批量完成注册、取信、验证与授权流程；**滑块验证码自动完成**，激活链接自动提取。
 - 支持重新授权、更新凭据、按状态筛选。
+
+### 待注册账号
+
+导入时按格式自动分流，两个库各存一份、互不干扰：
+
+| 导入内容 | 落到哪 |
+| --- | --- |
+| `email:password`（通用邮箱） | **待注册账号**（`pending.json`） |
+| `email----password----client_id----refresh_token`（Outlook） | 邮箱库（`mail.json`） |
+
+在「待注册」页勾选（或不勾选＝全部未注册）后点「开始注册」发起批量注册。
+注册助手里有「**中断注册**」按钮，随时关掉登录窗口并停下整条队列。
+
+### 注册助手
+
+- 全自动：打开注册页 → 填表单 → **自动过滑块验证码** → 提交 → 从邮箱自动取激活链接 → 打开链接 → 完成。
+- 抽屉里的按钮：打开登录窗口 / 重试 / 跳过该账号（批量时）/ **中断注册**。
 
 ## 安装
 
@@ -103,6 +124,56 @@ npm run dist
 ```
 
 修改 i18n 文案后，可用 `npm run check:i18n` 检查中英文词条是否一致。
+
+### 自动注册的额外依赖（Python）
+
+自动过阿里云滑块验证码需要 Python 侧环境：
+
+```bash
+pip install playwright numpy pillow
+```
+
+不需要 `playwright install`：求解器不启动浏览器，而是通过 CDP 挂到注册窗口上。
+
+原理：注册窗口是 WebView2，每次注册现取一个高位空闲端口开调试（不再用 9222/9223 这类
+固定端口 —— 页面 CSP 不拦 localhost，固定端口本身就是可探测的自动化特征）。
+求解器连上这个端口，在**同一个会话**里用 CDP 原生鼠标事件拖动滑块 —— 验证码 token 与
+`certifyId` 绑定，换一个浏览器解出来也搬不进注册表单；而 WebView2 内用 JS 合成事件会被
+行为分析拒绝（`isTrusted=false`），所以必须走 CDP。
+
+> 注意：注册窗口尺寸由账号指纹档案决定（下限 1120×820）。窗口太小时滑块会落到视口之外，
+> 鼠标事件落在窗口外，表现为「点了没反应」。
+
+### 账号指纹隔离
+
+每个账号注册时都带一份**独立且自洽**的浏览器指纹：`src-tauri/src/persona.rs` 按账号
+`device_mid` 确定性派生，`src-tauri/assets/zpool-fp.js` 在 document-start 覆盖。
+同一邮箱永远得到同一份档案，不同账号得到不同档案。
+
+| 维度 | 处理 |
+| --- | --- |
+| 屏幕分辨率 / 窗口尺寸与位置 | 从真实整机配置里选，窗口位置与伪屏幕自洽 |
+| CPU 核心数 / 内存 | 成对选取，避免「24 核 8G」这类不可能的组合 |
+| WebGL vendor / renderer | 换成同厂商其他型号，真实能力值（纹理上限等）不动 |
+| Canvas / AudioContext | 每账号一份确定性微扰，肉眼不可见但哈希必变 |
+| `userAgentData` 品牌 | 摘掉 `Microsoft Edge WebView2`，版本保持运行时真实值 |
+| `chrome.webview` | 删除（真实 Edge 浏览器没有这个对象） |
+| WebRTC | 过滤 srflx / prflx / relay 与明文 IP 候选，只留 mDNS 主机候选 |
+| UA | 不再硬编码 —— 交给 WebView2 运行时，保证与 `userAgentData` 同源 |
+| 宿主通信 | 指令走 `CustomEvent`，不再往 `window` 上挂 `__ZPOOL_CFG` / `__zpool` |
+
+刻意**保持真实值**的项：时区、语言、字体列表。它们必须与出口 IP 的地理位置一致，
+在没有 GeoIP 对齐之前，伪造出的「美区时区 + 中国 IP」比不改更显眼。
+
+改完指纹相关代码后，用 `scripts/fp_probe.py` 做回归：它通过 CDP 分别采集主窗口
+（未注入基线）与注册窗口的指纹，两边一对比就知道有没有哪一项静默失效。
+
+```bash
+pip install websocket-client
+python scripts/fp_probe.py open-login
+python scripts/fp_probe.py probe auto chat.z.ai   # auto = 从宿主日志读注册窗口端口
+python scripts/fp_probe.py close-login
+```
 
 ## 使用说明
 

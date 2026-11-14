@@ -967,7 +967,9 @@ impl Gateway {
             let mut got = None;
             let mut last = String::new();
             for attempt in 0..4u64 {
-                match store::account_quota(paths, id) {
+                // force：上面刚判断过这个号在本进程里已经过了 TTL，
+                // 这一趟是来拿**新鲜数据做路由决策**的，不能被展示缓存挡回去。
+                match store::account_quota(paths, id, true) {
                     Ok(ov) => {
                         got = Some(ov);
                         break;
@@ -2418,7 +2420,8 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
         }
         "/proxy/account/quota" => {
             let id = query_param(&url, "id").unwrap_or_default();
-            return match store::account_quota(&paths, &id) {
+            // 管理台的展示接口：走盘上快照，刷新由页面自己按 TTL 触发。
+            return match store::account_quota(&paths, &id, false) {
                 Ok(q) => reply_json(req, 200, &json!(q)),
                 Err(e) => reply_json(req, 400, &json!({ "error": e })),
             };
@@ -2666,31 +2669,26 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
         "/proxy/mail/upsert" => {
             let v: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
             let line = v.get("line").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let Some((email, password, client_id, refresh_token)) = crate::pool::parse_lines(&line).into_iter().next() else {
-                return reply_json(req, 400, &json!({ "error": "行格式不对，应为 email----password----client_id----refresh_token" }));
+            let Some(parsed) = crate::pool::parse_line(&line, &store::now_ts()) else {
+                return reply_json(req, 400, &json!({ "error": "行格式不对：email:password，或 email----password----client_id----refresh_token" }));
             };
             let root = paths.store_dir();
+            let email = parsed.email.clone();
             let r = {
                 let _g = crate::store_guard();
                 let mut accounts = crate::pool::load(&root);
                 let updated = if let Some(a) = crate::pool::find_mut(&mut accounts, &email) {
-                    a.password = password;
-                    a.client_id = client_id;
-                    a.refresh_token = refresh_token;
+                    a.password = parsed.password.clone();
+                    a.client_id = parsed.client_id.clone();
+                    a.refresh_token = parsed.refresh_token.clone();
+                    a.imap_host = parsed.imap_host.clone();
+                    a.imap_port = parsed.imap_port;
+                    a.imap_user = None;
                     a.status = crate::pool::STATUS_NEW.to_string();
                     a.note = None;
                     true
                 } else {
-                    accounts.push(crate::pool::MailAccount {
-                        email: email.clone(),
-                        password,
-                        client_id,
-                        refresh_token,
-                        status: crate::pool::STATUS_NEW.to_string(),
-                        verified_at: None,
-                        note: None,
-                        created_at: store::now_ts(),
-                    });
+                    accounts.push(parsed.clone());
                     false
                 };
                 match crate::pool::save(&root, &accounts) { Ok(()) => Ok(updated), Err(e) => Err(e) }

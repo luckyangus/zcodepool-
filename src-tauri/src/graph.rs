@@ -195,7 +195,7 @@ fn html_unescape(s: &str) -> String {
         .replace("&gt;", ">")
 }
 
-fn scan_links(hay: &str) -> Vec<String> {
+pub fn scan_links(hay: &str) -> Vec<String> {
     const NEEDLES: [&str; 2] = ["https://chat.z.ai/", "http://chat.z.ai/"];
     let mut out: Vec<String> = Vec::new();
     for needle in NEEDLES {

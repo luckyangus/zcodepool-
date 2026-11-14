@@ -1,5 +1,6 @@
 use crate::i18n::{tr, trf};
 use crate::quota;
+use crate::quota_cache;
 use crate::zcrypto;
 use chrono::Local;
 use serde::{Deserialize, Serialize};
@@ -103,6 +104,13 @@ pub struct Settings {
     pub language: Option<String>,
     #[serde(default)]
     pub auto_claim: Option<bool>,
+
+    /// 注册完成后自动绑定的邀请码。**空 = 用内置默认值**（见 `invite::DEFAULT_CODE`）。
+    ///
+    /// 只在注册/登录收尾时用一次：把 zcode 网页登录态写进注册窗口，
+    /// 再让邀请页自己跑完「无感验证码 → bind-code」。绑不上不算注册失败。
+    #[serde(default)]
+    pub invite_code: Option<String>,
 
     #[serde(default)]
     pub relay_external: Option<bool>,
@@ -1031,12 +1039,34 @@ pub fn update_account_from_live(paths: &Paths, id: &str) -> Result<Account, Stri
     Ok(acc)
 }
 
-pub fn live_quota(paths: &Paths) -> Result<quota::QuotaOverview, String> {
+/// `force=false` 时优先吃盘上的快照，见 [`crate::quota_cache`]。
+pub fn live_quota(paths: &Paths, force: bool) -> Result<quota::QuotaOverview, String> {
+    let dir = paths.store_dir();
+    if !force {
+        if let Some(ov) = cached_quota(&dir, quota_cache::LIVE_KEY) {
+            return Ok(ov);
+        }
+    }
     let creds = read_live(paths)?.ok_or(tr("err.live.no_file"))?;
     if !is_logged_in(&creds) {
         return Err(tr("err.live.quota"));
     }
-    quota::quota_for_live(&paths.home, &creds, read_live_config(paths).as_ref())
+    let ov = quota::quota_for_live(&paths.home, &creds, read_live_config(paths).as_ref())?;
+    remember_quota(&dir, quota_cache::LIVE_KEY, &ov);
+    Ok(ov)
+}
+
+/// 从盘上取一条还没过期的快照。反序列化失败按「没有缓存」处理 ——
+/// 结构升级后旧文件读不出来，退回联网总比直接报错好。
+fn cached_quota(dir: &Path, id: &str) -> Option<quota::QuotaOverview> {
+    let v = quota_cache::read(dir, id)?;
+    serde_json::from_value::<quota::QuotaOverview>(v).ok()
+}
+
+fn remember_quota(dir: &Path, id: &str, ov: &quota::QuotaOverview) {
+    if let Ok(v) = serde_json::to_value(ov) {
+        quota_cache::write(dir, id, &v);
+    }
 }
 
 pub fn account_mid(paths: &Paths, id: &str) -> Result<String, String> {
@@ -1046,10 +1076,25 @@ pub fn account_mid(paths: &Paths, id: &str) -> Result<String, String> {
         .ok_or_else(|| trf("err.mid.missing", &[("name", &acc.name)]))
 }
 
-pub fn account_quota(paths: &Paths, id: &str) -> Result<quota::QuotaOverview, String> {
+/// `force=false` 时优先吃盘上的快照。
+///
+/// 启动时前端会把所有账号排进刷新队列、逐条走这里；有缓存就不会真的联网，
+/// 界面立刻出数，只有真正过期的账号才会去打上游。
+///
+/// 需要「新鲜数据才能做对决定」的调用方必须传 `true`：网关的额度预热
+/// （`gateway::warm_quota`）靠额度选号，吃到旧值可能挑到已经没额度的号。
+pub fn account_quota(paths: &Paths, id: &str, force: bool) -> Result<quota::QuotaOverview, String> {
+    let dir = paths.store_dir();
+    if !force {
+        if let Some(ov) = cached_quota(&dir, id) {
+            return Ok(ov);
+        }
+    }
     let acc = load_account(paths, id)?;
     let mid = account_mid(paths, id)?;
-    quota::quota_for_snapshot_mid(&paths.home, &acc.credentials, acc.config.as_ref(), Some(&mid))
+    let ov = quota::quota_for_snapshot_mid(&paths.home, &acc.credentials, acc.config.as_ref(), Some(&mid))?;
+    remember_quota(&dir, id, &ov);
+    Ok(ov)
 }
 
 fn ensure_virtual_device_mid_locked(paths: &Paths, id: &str) -> Result<String, String> {

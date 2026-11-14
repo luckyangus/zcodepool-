@@ -3,13 +3,14 @@ import { listen } from "@tauri-apps/api/event";
 import { t, has, stripErr } from "./i18n.js";
 import { ic } from "./icons.js";
 import { esc, toast } from "./ui.js";
+import { randName } from "./names.js";
 
 const STEPS = {
   register: [
     "open-signup", "signup-form", "await-email", "open-link",
-    "complete-signup", "back-to-authorize", "confirm-authorize", "done",
+    "complete-signup", "back-to-authorize", "confirm-authorize", "bind-invite", "done",
   ],
-  login: ["confirm-authorize", "done"],
+  login: ["confirm-authorize", "bind-invite", "done"],
   observe: [],
 };
 
@@ -25,8 +26,9 @@ const PAGE_KEYS = {
 
 const MAX_LOGS = 200;
 
-const LINK_POLL_MS = 3000;
-const LINK_POLL_TRIES = 30; 
+// 取激活链接：每 5 秒查一次，共 6 次；都没取到就判定该账号注册失败。
+const LINK_POLL_MS = 5000;
+const LINK_POLL_TRIES = 6;
 const LINK_MAX_AUTO = 3;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -40,6 +42,18 @@ let linkBusy = false;
 let onSkip = null;
 export function setRegSkip(fn) {
   onSkip = fn;
+}
+
+let onAbort = null;
+/** 中断整个注册流程（关掉登录窗口 + 停止批量队列）。 */
+export function setRegAbort(fn) {
+  onAbort = fn;
+}
+
+let onFail = null;
+/** 取不到激活链接 → 判定该账号注册失败（由上层标记并收尾）。 */
+export function setRegFail(fn) {
+  onFail = fn;
 }
 
 function tr(group, key, params) {
@@ -77,6 +91,8 @@ export function regStart(mode, provider) {
     submittedAt: 0,
   };
   linkBusy = false;
+  captchaBusy = false;
+  captchaQueued = false;
   pushLog("info", "connected", provider);
   render();
 }
@@ -112,7 +128,9 @@ export function regEvent(ev) {
       S.note = !ev.code || ev.code === "clear" ? "" : tr("reg.note", ev.code, { a: ev.a });
       break;
     case "ask":
-      if (S.batchEmail) {
+      if (ev.ask === "captcha") {
+        solveCaptcha();
+      } else if (S.batchEmail) {
         if (ev.ask === "signup") autoSignup();
         else autoFetchLink();
       } else if (ev.ask === "link") {
@@ -123,6 +141,14 @@ export function regEvent(ev) {
       break;
     case "log":
       if (ev.code === "submitted") S.submittedAt = Date.now();
+      if (ev.code === "finishBlocked") {
+        // 网络环境级限流：换号也没用，整条队列都得停下
+        pushLog("error", "finishBlocked", ev.a);
+        toast(t("reg.finishBlocked"), "err", ev.a || "");
+        if (onFail) onFail(`上游限流：${ev.a || ""}`);
+        if (onAbort) onAbort();
+        return;
+      }
       pushLog(ev.level || "info", ev.code, ev.a, ev.b);
       break;
     case "closed":
@@ -183,9 +209,8 @@ async function autoFetchLink() {
   const sinceMs = anchor - 60_000;
 
   let link = "";
-  let fail = "";
-  let info = "";
-  for (let i = 0; i < LINK_POLL_TRIES && !S.closed; i++) {
+  let lastErr = "";
+  for (let i = 1; i <= LINK_POLL_TRIES && !S.closed; i++) {
     try {
       const r = await invoke("reg_fetch_link", { email, limit: 15, since: sinceMs });
       const links = (r && r.links) || [];
@@ -195,25 +220,22 @@ async function autoFetchLink() {
       }
       const n = Number(r && r.scanned) || 0;
       const subj = String((r && r.newestSubject) || "").trim();
-      info = subj ? t("reg.linkNewest", { n, s: subj }) : t("reg.linkEmptyBox", { n });
-      fail = "";
+      lastErr = subj ? t("reg.linkNewest", { n, s: subj }) : t("reg.linkEmptyBox", { n });
     } catch (e) {
-      fail = stripErr(e);
-      pushLog("warn", "fetchLinkErr", fail);
-      if (isCredentialError(fail)) {
-        toast(t("reg.linkDead"), "err", fail);
-        if (onSkip) onSkip();
-        return;
-      }
-      break;
+      // 单次取信失败（IMAP 探测超时 / 冷却 / 网络抖动）不该放弃这一轮：
+      // 以前这里直接 break，一次抖动就退化成手动输入，第二个号经常就栽在这。
+      lastErr = stripErr(e);
+      pushLog("warn", "fetchLinkErr", lastErr);
     }
-    pushLog("info", "fetchLinkPolling", String(Math.round(((i + 1) * LINK_POLL_MS) / 1000)), String(i + 1));
-    render();
-    await sleep(LINK_POLL_MS);
+    if (i < LINK_POLL_TRIES) {
+      pushLog("info", "fetchLinkPolling", String(i), String(LINK_POLL_TRIES));
+      render();
+      await sleep(LINK_POLL_MS);
+    }
   }
   linkBusy = false;
 
-  if (!link) return startManualLink(fail || info || "timeout");
+  if (!link) return failLink(lastErr || "timeout");
 
   S.linkAuto += 1;
   try {
@@ -221,9 +243,77 @@ async function autoFetchLink() {
     pushLog("ok", "fetchLinkFound", link);
   } catch (e) {
     pushLog("warn", "fetchLinkPushFail", stripErr(e));
-    startManualLink("pushFail");
+    failLink(stripErr(e));
   }
   render();
+}
+
+/**
+ * 6 次都没取到链接 → 判定该账号注册失败。
+ * 不再退化成手动输入：失败会被标记进「注册失败」分类，队列继续跑下一个。
+ */
+function failLink(reason) {
+  if (reason) pushLog("warn", "fetchLinkFailed", reason);
+  render();
+  if (onFail) onFail(reason);
+}
+
+let captchaBusy = false;
+let captchaQueued = false;
+
+// 单次求解现在很快（内部轮数少、超时短），所以可以多试几轮、间隔也缩短。
+const CAPTCHA_MAX_TRIES = 4;
+const CAPTCHA_RETRY_MS = 3000;
+
+/**
+ * 自动完成注册表单上的滑块验证码。
+ * 求解器通过 CDP 挂到同一个 WebView2 上拖动，成功后页面自己变成「验证通过」，
+ * driver 的门控随即放行 —— 所以这里只负责触发与回报，不搬运 token。
+ */
+async function solveCaptcha(tries = 0) {
+  if (captchaBusy) {
+    // 求解器正在跑，driver 又发来请求：记下来，本轮结束立刻接上，
+    // 直接丢弃会让「重试」看起来毫无反应。
+    captchaQueued = true;
+    return;
+  }
+  if (!S || S.closed) return;
+  captchaBusy = true;
+  // 求解期间把状态写在抽屉上：否则用户只看到「开始自动求解」后长时间没动静，
+  // 会以为已经放弃了。
+  if (tries === 0) {
+    pushLog("info", "captchaSolveStart");
+    S.note = t("reg.note.solvingCaptcha");
+  } else {
+    S.note = t("reg.note.solvingCaptchaRetry", { a: tries + 1, b: CAPTCHA_MAX_TRIES });
+  }
+  render();
+
+  let ok = false;
+  try {
+    const r = await invoke("captcha_solve");
+    ok = !!(r && r.ok);
+    if (ok) {
+      S.note = "";
+      pushLog("ok", "captchaSolved", String(r.attempts ?? ""), String(r.elapsed ?? ""));
+    } else {
+      pushLog("warn", "captchaSolveFail", String((r && r.error) || ""));
+    }
+  } catch (e) {
+    pushLog("warn", "captchaSolveErr", stripErr(e));
+  }
+
+  captchaBusy = false;
+  render();
+
+  const needRetry = captchaQueued || (!ok && tries + 1 < CAPTCHA_MAX_TRIES);
+  captchaQueued = false;
+  if (needRetry && S && !S.closed) {
+    if (!ok) {
+      pushLog("info", "captchaRetrying", String(tries + 2), String(CAPTCHA_MAX_TRIES));
+    }
+    setTimeout(() => solveCaptcha(ok ? 0 : tries + 1), CAPTCHA_RETRY_MS);
+  }
 }
 
 function startManualLink(reason) {
@@ -296,6 +386,7 @@ function render() {
       <button class="btn sm" data-act="reveal">${ic("play", 12)} ${esc(t("reg.btn.reveal"))}</button>
       <button class="btn sm" data-act="retry">${ic("refresh", 12)} ${esc(t("reg.btn.retry"))}</button>
       ${S.batchEmail ? `<button class="btn sm" data-act="skip">${ic("x", 12)} ${esc(t("reg.btn.skip"))}</button>` : ""}
+      <button class="btn sm d" data-act="abort">${ic("power", 12)} ${esc(t("reg.btn.abort"))}</button>
     </div>
     ${S.note ? `<div class="drw-note">${ic("alert", 14)}<span>${esc(S.note)}</span></div>` : ""}
     ${stepsHtml}
@@ -315,7 +406,13 @@ async function onAction(act) {
   if (act === "close") return regClose();
   try {
     if (act === "reveal") await invoke("reg_action", { action: "reveal" });
-    else if (act === "retry") {
+    else if (act === "abort") {
+      // 中断：先关登录窗口，再让上层停掉批量队列（否则下一个号还会被拉起来）
+      await invoke("reg_close_window").catch(() => {});
+      if (onAbort) onAbort();
+      pushLog("warn", "aborted");
+      return;
+    } else if (act === "retry") {
       S.failed = false;
       await invoke("reg_action", { action: "retry" });
     } else if (act === "skip") {
@@ -348,13 +445,6 @@ function field(id, label, type, placeholder, extra = "") {
       <input id="${id}" class="inp" type="${type}" placeholder="${esc(placeholder)}"
         autocomplete="off" spellcheck="false" ${extra}>
     </label>`;
-}
-
-function randName() {
-  const A = "abcdefghijklmnopqrstuvwxyz";
-  let s = "";
-  for (let i = 0; i < 6; i++) s += A[Math.floor(Math.random() * A.length)];
-  return s;
 }
 
 async function importAccounts(mask) {

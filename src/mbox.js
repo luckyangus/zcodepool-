@@ -59,7 +59,7 @@ export function mboxPage() {
   const progress = b.running
     ? `<div class="prog">
          <div class="prog-bar"><i style="width:${b.total ? Math.round((b.done / b.total) * 100) : 0}%"></i></div>
-         <div class="prog-txt">${esc(t("mb.batch.progress", { done: b.done, total: b.total }))}${b.current ? ` · ${esc(b.current)}` : ""}</div>
+         <div class="prog-txt">${esc(t("mb.batch.progress", { done: b.done, total: b.total }))}${b.current ? ` · ${esc(b.current)}` : ""}${b.stage ? ` · ${esc(t(`mb.batch.stage.${b.stage}`))}` : ""}</div>
        </div>`
     : "";
   const rows = filtered();
@@ -71,6 +71,7 @@ export function mboxPage() {
         <input type="checkbox" class="cbx mb-check" aria-label="${esc(a.email)}" data-email="${esc(a.email)}" ${M.sel.has(a.email) ? "checked" : ""}
           ${b.running ? "disabled" : ""}>
         <span class="mail" title="${esc(a.email)}">${esc(a.email)}</span>
+        <span class="chip" style="font-size:10px;padding:1px 6px" title="${esc(a.kind === "outlook" ? "Microsoft Graph" : a.imap_host || t("mb.imapAuto"))}">${esc(a.kind === "outlook" ? "Outlook" : "IMAP")}</span>
         ${badge(a)}
         <span class="when">${esc(a.verified_at || "")}</span>
         ${a.status === "invalid" ? `<button class="btn sm mb-reauth" data-reauth="${esc(a.email)}">${esc(t("mb.reauth"))}</button>` : ""}
@@ -84,6 +85,7 @@ export function mboxPage() {
          <div>${esc(t("mb.empty"))}</div>
          <div class="fmt">
            <div class="fmt-hint">${esc(t("mb.formatHint"))}</div>
+           <code>email:password</code>
            <code>email----password----client_id----refresh_token</code>
          </div>
        </div>`;
@@ -107,6 +109,7 @@ export function mboxPage() {
     </dl>
     <section class="toolbar">
       <button class="btn p" click="actions.mboxImport()" ${b.running ? "disabled" : ""}>${ic("import", 15)} ${t("mb.import")}</button>
+      <button class="btn" click="actions.pasteImport()" ${b.running ? "disabled" : ""}>${ic("pen", 14)} ${t("pd.paste")}</button>
       <button class="btn" click="actions.mboxExport()" ${M.list.length && !b.running ? "" : "disabled"}>${ic("export", 14)} ${t("mb.export")}</button>
       <button class="btn" click="actions.mboxVerify()" ${!M.sel.size || b.running ? "disabled" : ""}>${ic("play", 14)} ${t("mb.verify")}${M.sel.size ? ` (${M.sel.size})` : ""}</button>
       <button class="btn" click="actions.mboxStop()" ${b.running ? "" : "disabled"}>${ic("power", 14)} ${t("mb.stop")}</button>
@@ -326,16 +329,26 @@ export async function mboxReauth(email) {
 }
 
 
-export async function mboxVerify() {
-  const emails = [...M.sel].filter((e) => {
-    const a = M.list.find((x) => x.email === e);
-    return a && a.status === "new";
-  });
+/**
+ * 启动批量注册。
+ * 不传参：用邮箱库里勾选的未验证号。
+ * 传数组：用给定的邮箱——「待注册账号」页从这里发起。
+ */
+export async function mboxVerify(emailsOverride) {
+  let emails;
+  if (Array.isArray(emailsOverride)) {
+    emails = emailsOverride.slice();
+  } else {
+    emails = [...M.sel].filter((e) => {
+      const a = M.list.find((x) => x.email === e);
+      return a && a.status === "new";
+    });
+  }
   if (!emails.length) {
     toast(t("mb.nothingToVerify"), "warn");
     return;
   }
-  M.batch = { running: true, queue: emails.slice(), total: emails.length, done: 0, current: "", results: [] };
+  M.batch = { running: true, queue: emails.slice(), total: emails.length, done: 0, current: "", stage: "", results: [] };
   rerender();
   runNext();
 }
@@ -346,6 +359,30 @@ async function runNext() {
   if (!b.queue.length) return finishBatch();
   const email = b.queue.shift();
   b.current = email;
+  b.stage = "precheck";
+  rerender();
+
+  // 先预检邮箱：连不上或读不了收件箱就当场判失败。
+  // 放在注册之前很关键 —— 否则要白开一次登录窗口、白过一次滑块验证码，
+  // 最后才发现邮箱是死的。
+  try {
+    const r = await invoke("mail_precheck", { email });
+    if (!r || !r.ok) throw new Error((r && r.error) || t("mb.precheckFailed"));
+    toast(t("mb.precheckOk", { email, n: r.messages ?? 0 }), "ok");
+  } catch (e) {
+    const msg = String(e).replace(/^[a-z_]+:/, "");
+    b.done += 1;
+    b.stage = "";
+    b.results.push({ email, ok: false, error: msg });
+    await invoke("pool_mark_verified", { email, ok: false, note: msg }).catch(() => {});
+    toast(t("mb.precheckFailedToast", { email }), "warn");
+    mboxLoad().then(rerender);
+    setTimeout(runNext, 400);
+    return;
+  }
+  if (!b.running) return;
+
+  b.stage = "register";
   rerender();
   try {
     regStart("register", "zai");
@@ -354,6 +391,7 @@ async function runNext() {
   } catch (e) {
     const msg = String(e).replace(/^[a-z_]+:/, "");
     b.done += 1;
+    b.stage = "";
     b.results.push({ email, ok: false, error: msg });
     await invoke("pool_mark_verified", { email, ok: false, note: msg }).catch(() => {});
     setTimeout(runNext, 400);
@@ -380,6 +418,23 @@ export function mboxStop() {
   invoke("reg_close_window").catch(() => {});
   toast(t("mb.batch.stopped"), "warn");
   rerender();
+}
+
+/** 取不到激活链接等情况：把当前号标记为失败，然后继续下一个。 */
+export function mboxFailCurrent(reason) {
+  const b = M.batch;
+  if (!b.running || !b.current) return;
+  const email = b.current;
+  b.current = "";
+  b.done += 1;
+  const note = reason || t("mb.batch.linkFailed");
+  b.results.push({ email, ok: false, error: note });
+  invoke("pool_mark_verified", { email, ok: false, note }).catch(() => {});
+  regBatchSet("");
+  invoke("reg_close_window").catch(() => {});
+  toast(t("mb.batch.failedToast", { email }), "warn");
+  mboxLoad().then(rerender);
+  setTimeout(runNext, 600);
 }
 
 export function mboxSkipCurrent() {
@@ -432,4 +487,17 @@ export function mboxDismissResult() {
 
 export function mboxCurrent() {
   return M.batch.running ? M.batch.current : "";
+}
+
+/** 批量注册的实时进度。状态在 mbox 里，但「待注册」页也要展示，所以导出。 */
+export function mboxBatchInfo() {
+  const b = M.batch;
+  if (!b.running) return { running: false };
+  return {
+    running: true,
+    done: b.done,
+    total: b.total,
+    current: b.current,
+    stage: b.stage,
+  };
 }

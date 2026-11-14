@@ -1,13 +1,29 @@
 (function () {
   "use strict";
-  if (window.__zpool) return;
+  // 重复注入守卫：用 Symbol 做键。Object.keys / getOwnPropertyNames 都看不见
+  // Symbol 键，比 `window.__zpool` 这种可枚举标记隐蔽得多。
+  var GUARD = Symbol.for("zpool.driver");
+  if (window[GUARD]) return;
   if (window.top !== window.self) return;
+  try { Object.defineProperty(window, GUARD, { value: 1, configurable: true }); } catch (e) {}
 
-  var CFG = window.__ZPOOL_CFG || {};
+  // CFG / PERSONA 由外层 bootstrap IIFE 提供（见 driver.rs），不挂 window。
   var POLL_MS = 900;
   var FORM_SETTLE_MS = 20000;
   var RETRY_BACKOFF_MS = 12000;
   var FINISH_WAIT_MS = 25000;
+  // 求解一直没成功就允许宿主再试一轮：验证码不可能必中，
+  // 只请求一次的话失败一次就永久卡在「等你过验证」。
+  //
+  // 间隔必须大于单次求解的正常耗时 —— 实测 8~45 秒（成功 8.0/8.5/39.5，
+  // 失败 38.8/43.9）。原来的 30 秒几乎每次都撞在求解中途，reask 只能排进队列，
+  // 等于白记一条日志。
+  var CAPTCHA_REASK_MS = 45000;
+  var CAPTCHA_REASK_MAX = 4;
+  // 「请手动过验证」的提示阈值。宿主侧一轮最多重试 4 次、单次最长 90 秒，
+  // 算下来机器还可能跑三分钟以上；提示必须晚于这个窗口，
+  // 否则用户提前介入，反而打断正在跑的重试。
+  var CAPTCHA_HINT_MS = 180000;
   var SIGNUP_URL = "https://chat.z.ai/auth?action=signup";
   var STORE_KEY = "zpool-driver-state";
   var SIGNUP_HYDRATE_MS = 4500;
@@ -48,6 +64,9 @@
     entrySince: 0,
     capSnap: "",
     gateWarned: false,
+    captchaAsked: false,
+    captchaAskedAt: 0,
+    captchaReask: 0,
     timer: 0
   };
 
@@ -76,7 +95,10 @@
         signupReloads: S.signupReloads,
         signupClicked: S.signupClicked,
         signupClickAt: S.signupClickAt,
-        entrySince: S.entrySince
+        entrySince: S.entrySince,
+        captchaAsked: S.captchaAsked,
+        captchaAskedAt: S.captchaAskedAt,
+        captchaReask: S.captchaReask
       }));
     } catch (e) {
     }
@@ -114,6 +136,9 @@
     S.signupClicked = !!saved.signupClicked;
     S.signupClickAt = Number(saved.signupClickAt) || 0;
     S.entrySince = Number(saved.entrySince) || 0;
+    S.captchaAsked = !!saved.captchaAsked;
+    S.captchaAskedAt = Number(saved.captchaAskedAt) || 0;
+    S.captchaReask = Number(saved.captchaReask) || 0;
   })();
 
   function q(kv) {
@@ -420,9 +445,16 @@
 
   function probeFinish() {
     var pws = allInputs().filter(function (e) { return e.type === "password"; });
+    var body = bodyText();
+    // 上游的拒绝提示。实测文案：
+    //   「无法完成注册：当前网络环境的注册请求过于频繁，请约 5 小时后重试…」
+    // 出现它就必须停手 —— 继续点「完成注册」只是白刷请求，还会一直弹这个提示。
+    var blockedRe = /无法完成注册|注册请求过于频繁|请求过于频繁|请约\s*\d+\s*小时|请联系客服|rate limit|too many requests/i;
     return {
       pwdCount: pws.length,
-      hasButton: !!findButton(/^(完成注册|完成|设置密码|Finish|Continue|继续)$/)
+      hasButton: !!findButton(/^(完成注册|完成|设置密码|Finish|Continue|继续)$/),
+      blocked: blockedRe.test(body),
+      errorHint: (body.match(/(无法完成注册|注册请求过于频繁|请求过于频繁)[^。]{0,60}/i) || [])[0] || ""
     };
   }
 
@@ -660,7 +692,43 @@
       }
     }
     if (S.submitGateAt > 0) {
-      if (Date.now() >= S.submitGateAt && !S.gateWarned) {
+      var gateExpired = Date.now() >= S.submitGateAt;
+      // 上次求解迟迟没让验证码通过 → 放开标志，让宿主再试一轮。
+      var reask = false;
+      if (
+        S.captchaAsked &&
+        S.captchaAskedAt &&
+        Date.now() - S.captchaAskedAt > CAPTCHA_REASK_MS &&
+        S.captchaReask < CAPTCHA_REASK_MAX
+      ) {
+        S.captchaAsked = false;
+        S.captchaAskedAt = 0;
+        S.captchaReask += 1;
+        reask = true;
+        saveState();
+        log("captchaReask", String(S.captchaReask));
+      }
+      // 验证码挡着提交 → 交给宿主自动求解。
+      // 求解结果不需要回传 —— 页面自身会变成「验证通过」，上面的 captchaVerified() 随即放行。
+      if (!S.captchaAsked && (st.hasVerifyBtn || gateExpired)) {
+        S.captchaAsked = true;
+        S.captchaAskedAt = Date.now();
+        saveState();
+        note("solvingCaptcha");
+        // reask 必须 force。ask() 内部有「同一 kind 只发一次」的一次性守卫
+        // （S.asked[kind]），不 force 的话第二次请求会被静默吞掉 ——
+        // 之前就是这样：日志里 captchaReask 一路涨到 3，宿主却只收到过一次 ask，
+        // 于是前端 4 次重试跑完就彻底没人再求解，账号一直卡到手动提示。
+        ask("captcha", reask);
+      }
+      // 只有「请求过求解 + 过了足够久 + 仍未通过」才提示手动，
+      // 而不是门控一到期就喊。
+      if (
+        S.captchaAsked &&
+        S.captchaAskedAt &&
+        Date.now() - S.captchaAskedAt > CAPTCHA_HINT_MS &&
+        !S.gateWarned
+      ) {
         S.gateWarned = true;
         warn("captchaPending");
       }
@@ -759,8 +827,18 @@
       return;
     }
     clearNote();
+    // 上游直接拒绝时别再提交了，直接上报（宿主会停掉整条队列）
+    if (st.blocked) {
+      S.stopped = true;
+      saveState();
+      send({ kind: "log", level: "error", code: "finishBlocked", a: st.errorHint || "" });
+      return;
+    }
     if (S.finishTried) return;
+    // 必须落盘：这个标志只在内存里的话，页面一跳转就丢，
+    // 于是每次都重新提交一遍 —— 表现就是「弹窗一直死循环提交」。
     S.finishTried = true;
+    saveState();
 
     var pw = S.password || (S.answered.signup && S.answered.signup.password) || "";
     if (!pw) {
@@ -1009,7 +1087,8 @@
     }, ms || POLL_MS);
   }
 
-  window.__zpool = {
+  // 宿主指令入口。刻意不挂 window：页面枚举不到，也没法反向调用。
+  var HOST_API = {
     state: S,
     fromHost: function (m) {
       if (!m || typeof m !== "object") return;
@@ -1058,6 +1137,9 @@
           S.signupAt = 0;
           S.lastLogKey = "";
           S.noteKey = "";
+          S.captchaAsked = false;
+          S.captchaAskedAt = 0;
+          S.captchaReask = 0;
           log("retry");
           saveState();
           schedule(200);
@@ -1076,6 +1158,18 @@
     }
   };
 
-  send({ kind: "ready", page: currentPage(), url: location.href, mode: S.mode, provider: S.provider });
+  document.addEventListener("zpool:host", function (e) {
+    try { HOST_API.fromHost(e.detail); } catch (err) {}
+  });
+
+  send({
+    kind: "ready",
+    page: currentPage(),
+    url: location.href,
+    mode: S.mode,
+    provider: S.provider,
+    // 指纹注入生效项：注入静默失败时，从 flowlog 能一眼看出哪一项没落地。
+    a: (typeof PERSONA === "object" && PERSONA && PERSONA._applied) || "",
+  });
   schedule(400);
 })();

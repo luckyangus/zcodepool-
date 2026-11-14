@@ -134,9 +134,10 @@ pub fn run(args: &[String]) -> (String, i32) {
             Err(e) => return (err(&e), 1),
         },
         "quota" => {
+            // CLI 是用户主动查一次，必须拿最新的，不吃展示缓存。
             let res = match flag(rest, "--id") {
-                Some(id) => account_quota(&paths, &id),
-                None => live_quota(&paths),
+                Some(id) => account_quota(&paths, &id, true),
+                None => live_quota(&paths, true),
             };
             match res {
                 Ok(q) => ok(serde_json::to_value(&q).unwrap_or(Value::Null)),
@@ -174,6 +175,71 @@ pub fn run(args: &[String]) -> (String, i32) {
                 }
             }
             ok(json!({ "anyClaimable": any, "accounts": items }))
+        }
+        // 通用 IMAP 邮箱的寻址与取信探针（不落库，纯诊断）
+        "imap-probe" => {
+            let (Some(addr), Some(pw)) = (flag(rest, "--email"), flag(rest, "--password")) else {
+                return (err("--email 与 --password 必填"), 2);
+            };
+            match crate::imap::discover(&addr, &pw) {
+                Ok(ep) => {
+                    let take = flag(rest, "--limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(15);
+                    match crate::imap::fetch_links(&ep, &pw, take, None) {
+                        Ok(f) => ok(json!({
+                            "endpoint": ep,
+                            "links": f.links,
+                            "scanned": f.scanned,
+                            "newestSubject": f.newest_subject,
+                            "newestAt": f.newest_at,
+                        })),
+                        Err(e) => ok(json!({ "endpoint": ep, "fetchError": e })),
+                    }
+                }
+                Err(e) => return (err(&e), 1),
+            }
+        }
+        // 从邮箱池里取某个账号的激活链接（走与注册流程相同的分派逻辑）
+        "mail-fetch" => {
+            let Some(addr) = flag(rest, "--email") else {
+                return (err("--email 必填"), 2);
+            };
+            let root = Paths::detect().store_dir();
+            let accounts = crate::pool::load(&root);
+            let acc = match crate::pool::find(&accounts, &addr) {
+                Some(a) => a.clone(),
+                None => return (err(&format!("{addr} 不在邮箱池里")), 1),
+            };
+            let limit = flag(rest, "--limit")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(12);
+            let res: Result<Value, String> = if acc.is_outlook() {
+                match crate::graph::fetch_links(&acc.client_id, &acc.refresh_token, limit, None) {
+                    Ok((f, _)) => Ok(json!({
+                        "kind": "outlook", "links": f.links, "scanned": f.scanned,
+                        "newestSubject": f.newest_subject,
+                    })),
+                    Err(e) => Err(e),
+                }
+            } else {
+                let ep = match acc.endpoint() {
+                    Some(ep) => ep,
+                    None => match crate::imap::discover(&acc.email, &acc.password) {
+                        Ok(ep) => ep,
+                        Err(e) => return (err(&e), 1),
+                    },
+                };
+                match crate::imap::fetch_links(&ep, &acc.password, limit, None) {
+                    Ok(f) => Ok(json!({
+                        "kind": "imap", "endpoint": ep, "links": f.links, "scanned": f.scanned,
+                        "newestSubject": f.newest_subject,
+                    })),
+                    Err(e) => Err(e),
+                }
+            };
+            match res {
+                Ok(v) => ok(v),
+                Err(e) => return (err(&e), 1),
+            }
         }
         "behavior" => {
             let las = flag(rest, "--launch-after-switch");

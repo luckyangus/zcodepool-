@@ -5,7 +5,13 @@ use std::time::Duration;
 const TOKEN_URL: &str = "https://zcode.z.ai/api/v1/oauth/token";
 const FLOW_INIT_URL: &str = "https://zcode.z.ai/api/v1/oauth/cli/init";
 pub const FLOW_TIMEOUT_MS: u64 = 300_000;
-pub const LOGIN_WINDOW_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0";
+/// 仅用于 **Rust 侧发起的 HTTP 请求**（如 `fetch_userinfo`）伪装成浏览器。
+///
+/// 注册窗口**不再使用它**：那里必须让 WebView2 用运行时真实 UA —— 硬编码版本会
+/// 让 `navigator.userAgent`（131）与 `navigator.userAgentData.brands`（155）
+/// 自相矛盾，比不伪装更容易被识别。这里只是给服务端 WAF 看的，
+/// 版本不必与运行时逐位一致，但要跟得上当前 Chromium 代次。
+pub const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36 Edg/155.0.0.0";
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct OAuthProvider {
@@ -401,7 +407,7 @@ pub fn fetch_userinfo(provider: &str, token: &str) -> Option<Value> {
         .get(url)
         .set("Authorization", &auth)
         .set("Content-Type", "application/json")
-        .set("User-Agent", LOGIN_WINDOW_UA)
+        .set("User-Agent", BROWSER_UA)
         .call()
         .ok()?
         .into_string()

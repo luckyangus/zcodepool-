@@ -1,15 +1,19 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { esc, toast, openConfirmModal, openAddAccountModal, installDelegation } from "./ui.js";
+import { esc, toast, openConfirmModal, openAddAccountModal, openLineModal, installDelegation } from "./ui.js";
 import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr } from "./i18n.js";
-import { regActive, regStart, regClose, regEvent, setRegSkip } from "./reg.js";
+import { regActive, regStart, regClose, regEvent, setRegSkip, setRegAbort, setRegFail } from "./reg.js";
 import {
   setMboxRerender, mboxLoad, mboxPage, mboxFilter, mboxToggle, mboxImport,
   mboxRemove, mboxDelete, mboxSelection, mboxVerify, mboxStop, mboxOnOauthDone, mboxRunning, mboxCurrent, mboxStats,
   mboxSelectAll, mboxSelectNone, mboxToggleRow, mboxExport, mboxRetryFailed, mboxDismissResult, mboxUpdateLine, mboxReauth,
-  mboxSkipCurrent,
-} from "./mbox.js";
+  mboxSkipCurrent, mboxFailCurrent,
+} from "./mbox.js";import {
+  setPendingRerender, pendingLoad, pendingPage, pendingStats, pendingToggle, pendingToggleRow,
+  pendingSelectAll, pendingSelection, pendingRemove, pendingDelete, pendingStart, pendingFilter,
+  openBlockedModal,
+} from "./pending.js";
 
 const $app = document.getElementById("app");
 let state = null;
@@ -77,7 +81,7 @@ async function refresh() {
   autostart = await invoke("autostart_status").catch(() => false);
   relay = await invoke("relay_status").catch(() => relay);
   syncMintFrame(!!relay.external);
-  await mboxLoad();
+  await Promise.all([mboxLoad(), pendingLoad()]);
 }
 
 function uiLocked() {
@@ -101,13 +105,15 @@ async function guard(fn) {
   }
 }
 
-async function loadAcctQuota(id) {
+// force=true 绕过盘上快照：手动刷新、刚领完套餐必须走这条，
+// 否则会拿到 10 分钟内的旧数字，看起来像「点了没反应」。
+async function loadAcctQuota(id, force = false) {
   const cur = acctQuota[id] || {};
   if (cur.busy) return;
   acctQuota[id] = { busy: true };
   if (!uiLocked()) render();
   try {
-    const data = await invoke("get_account_quota", { id });
+    const data = await invoke("get_account_quota", { id, force });
     acctQuota[id] = { data, err: null, busy: false };
   } catch (e) {
     acctQuota[id] = { data: null, err: stripErr(e), busy: false };
@@ -171,7 +177,8 @@ const actions = {
     toast(t("st.refreshing"), "ok");
     for (const a of state.accounts) {
       acctQuota[a.id] = { data: acctQuota[a.id]?.data, busy: false };
-      loadAcctQuota(a.id);
+      // 全量刷新是显式动作，必须真的去上游问一遍。
+      loadAcctQuota(a.id, true);
     }
   },
 
@@ -184,6 +191,35 @@ const actions = {
   async mboxVerify() { await mboxVerify(); },
   async mboxStop() { mboxStop(); },
   async mboxFilter(f) { mboxFilter(f); },
+  async pendingImport() { await mboxImport(); },
+  /** 手动粘贴导入：每行一个账号，与文件导入走同一套解析与分流。 */
+  async pasteImport() {
+    openLineModal({
+      title: t("pd.pasteTitle"),
+      hint: t("pd.pasteHint"),
+      label: t("pd.pasteLabel"),
+      placeholder: "user@example.com:password",
+      rows: 8,
+      onSubmit: async (text) => {
+        const r = await invoke("pool_import_text", { text });
+        const msg = r.added
+          ? t("pd.pasteOk", { added: r.added, skipped: r.skipped })
+          : t("mb.importDup", { skipped: r.skipped });
+        toast(msg, r.added ? "ok" : "warn");
+        await Promise.all([mboxLoad(), pendingLoad()]);
+        render();
+      },
+    });
+  },
+  async pendingStart() { await pendingStart(); },
+  async pendingFilter(f) { pendingFilter(f); },
+  async blockedOpen() { await openBlockedModal(); },
+  async pendingDelete() {
+    const emails = pendingSelection();
+    if (!emails.length) return;
+    await pendingDelete(emails);
+    render();
+  },
   async mboxDelete() {
     const emails = mboxSelection();
     if (!emails.length) return;
@@ -487,7 +523,8 @@ const actions = {
   },
   acctQuota(id) {
     const dueAt = quotaDue[id];
-    loadAcctQuota(id).then(() => {
+    // 用户主动点的刷新：必须真的去上游问一次，否则点了没反应。
+    loadAcctQuota(id, true).then(() => {
       if (quotaDue[id] === dueAt) scheduleNext(id);
     });
   },
@@ -1336,12 +1373,16 @@ function render() {
       : t("m.status.loggedOut");
 
   const stats = mboxStats();
+  const pdStats = pendingStats();
   const sidebar = `
     <aside class="sidebar">
       <div class="side-brand"><span class="mark">Z·POOL</span>${appVer ? `<span class="v">v${esc(appVer)}</span>` : ""}<span class="brand-caption">${t("m.workspace")}</span></div>
       <nav class="nav">
         <button class="nav-item${tab === "mailbox" ? " on" : ""}" aria-current="${tab === "mailbox" ? "page" : "false"}" click="actions.setTab('mailbox')">
           ${ic("mail", 17)} ${t("m.tab.mailbox")}${stats.unverified ? `<span class="badge">${stats.unverified}</span>` : ""}
+        </button>
+        <button class="nav-item${tab === "pending" ? " on" : ""}" aria-current="${tab === "pending" ? "page" : "false"}" click="actions.setTab('pending')">
+          ${ic("userPlus", 17)} ${t("m.tab.pending")}${pdStats.pending ? `<span class="badge">${pdStats.pending}</span>` : ""}
         </button>
         <button class="nav-item${tab === "accounts" ? " on" : ""}" aria-current="${tab === "accounts" ? "page" : "false"}" click="actions.setTab('accounts')">
           ${ic("person", 17)} ${t("m.tab.accounts")}${s.accounts.length ? `<span class="badge">${s.accounts.length}</span>` : ""}
@@ -1366,6 +1407,8 @@ function render() {
   let body;
   if (tab === "mailbox") {
     body = mboxPage();
+  } else if (tab === "pending") {
+    body = pendingPage();
   } else if (tab === "settings") {
     body = settingsView(s);
   } else if (tab === "proxy") {
@@ -1425,12 +1468,18 @@ window.onRenameKey = (e, id) => {
 };
 installDelegation();
 setMboxRerender(() => { if (!uiLocked()) render(); });
+setPendingRerender(() => { if (!uiLocked()) render(); });
 setRegSkip(() => mboxSkipCurrent());
+setRegAbort(() => { if (mboxRunning()) mboxStop(); });
+setRegFail((reason) => mboxFailCurrent(reason));
 
 document.addEventListener("change", (e) => {
   const el = e.target;
   if (!el) return;
   if (el.id === "mb-all") { mboxSelectAll(el.checked); return; }
+  if (el.id === "pd-all") { pendingSelectAll(el.checked); return; }
+  const pcb = el.closest ? el.closest(".pd-check") : null;
+  if (pcb) { pendingToggle(pcb.dataset.email, pcb.checked); render(); return; }
   const cb = el.closest ? el.closest(".mb-check") : null;
   if (!cb) return;
   mboxToggle(cb.dataset.email, cb.checked);
@@ -1438,6 +1487,8 @@ document.addEventListener("change", (e) => {
 });
 document.addEventListener("click", (e) => {
   if (!e.target || !e.target.closest) return;
+  const pdel = e.target.closest(".pd-del");
+  if (pdel) { e.preventDefault(); pendingRemove(pdel.dataset.del).then(() => render()); return; }
   const del = e.target.closest(".mb-del");
   if (del) { e.preventDefault(); mboxRemove(del.dataset.del).then(() => render()); return; }
   const edit = e.target.closest(".mb-edit");
@@ -1446,11 +1497,14 @@ document.addEventListener("click", (e) => {
   if (reauth) { e.preventDefault(); mboxReauth(reauth.dataset.reauth); return; }
   if (e.target.closest("button, input, select, a, label")) return; // 控件自己处理
   const row = e.target.closest(".row[data-email]");
-  if (row) mboxToggleRow(row.dataset.email);
+  if (row) {
+    if (tab === "pending") pendingToggleRow(row.dataset.email);
+    else mboxToggleRow(row.dataset.email);
+  }
 });
 
 listen("pool-changed", () => {
-  mboxLoad().then(() => { if (!uiLocked()) render(); });
+  Promise.all([mboxLoad(), pendingLoad()]).then(() => { if (!uiLocked()) render(); });
 });
 
 listen("tray-action", (ev) => {
@@ -1477,7 +1531,8 @@ listen("claim://result", (ev) => {
     toast(t("m.claimOk", { name: p.accountName, plan: p.planName }), "ok", bits.join(t("common.listSep")));
   }
   if (p.accountId) {
-    loadAcctQuota(p.accountId);
+    // 刚领完套餐，额度必然变了 —— 必须绕开盘上快照。
+    loadAcctQuota(p.accountId, true);
     if (!autoClaimRunning) {
       loadClaimPreview(p.accountId).then(() => { if (!uiLocked()) render(); });
     }
@@ -1536,7 +1591,16 @@ function scheduleNext(id, base = Date.now()) {
 }
 function enrollAccounts() {
   const live = new Set((state?.accounts || []).map((a) => a.id));
-  for (const id of live) if (!(id in quotaDue)) quotaDue[id] = Date.now();
+  for (const id of live) {
+    if (!(id in quotaDue)) {
+      // 先用盘上快照把界面填上（不 force），下一次真正的刷新排到一个周期之后。
+      //
+      // 这里**不能**写 quotaDue[id] = Date.now()：sweepTick 是 force 的，
+      // 立即到期等于下一个 tick 就把「启动即全量重拉」原样搬回来。
+      loadAcctQuota(id);
+      scheduleNext(id);
+    }
+  }
   for (const id of Object.keys(quotaDue)) if (!live.has(id)) delete quotaDue[id];
 }
 function pokeAccount(id) { if (id) quotaDue[id] = Date.now(); }
@@ -1552,7 +1616,9 @@ async function sweepTick() {
   ticking = true;
   const dueAt = quotaDue[due.id];
   try {
-    await loadAcctQuota(due.id);
+    // 走到这里说明这个号真的到期了，必须绕开盘上快照 ——
+    // 否则后端会因为「缓存还没过展示期」直接返回旧值，刷新周期被悄悄拉长。
+    await loadAcctQuota(due.id, true);
     if (quotaDue[due.id] === dueAt) scheduleNext(due.id);
     if (!uiLocked()) render();
   } finally {

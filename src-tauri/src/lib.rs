@@ -1,14 +1,18 @@
 pub mod cli;
 pub mod i18n;
+mod captcha;
 mod claim;
 mod driver;
 mod flowlog;
 mod gateway;
 mod graph;
+mod imap;
 mod oauth;
+mod persona;
 mod pool;
 mod prompt;
 mod quota;
+mod quota_cache;
 mod store;
 mod usage;
 mod zcrypto;
@@ -23,6 +27,42 @@ use tauri_plugin_autostart::AutoLaunchManager;
 use tauri_plugin_dialog::DialogExt;
 
 const TRAY_ID: &str = "main";
+
+/// 登录窗口的 WebView2 附加参数。
+///
+/// 登录窗口有独立的 `data_directory`，因此会另起一个 WebView2 环境；
+/// 调试端口是按环境绑的，所以它**不能**沿用主窗口的端口，必须用自己的，
+/// 否则第二个环境绑不上，验证码求解器就看不到注册窗口（踩过）。
+/// 这里也刻意不带 `--no-proxy-server`：注册请求要能走用户配置的代理。
+///
+/// **调试端口不写在这里**：固定端口本身就是可探测的自动化特征 ——
+/// 实测在注册页里 `fetch('http://127.0.0.1:9222/json/version')` 能打通
+/// （页面 CSP 不拦 localhost），风控扫一眼就知道这台机器开着 CDP。
+/// 端口改成每次注册现取一个高位空闲端口，见 [`pick_cdp_port`]。
+///
+/// `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`：
+/// 实测未加之前，页面用一次 STUN 就能拿到本机**真实公网 IP**（srflx 候选），
+/// 配了代理也照样泄露 —— 多个账号露出同一个真实 IP 等于自报关联。
+const LOGIN_WEBVIEW_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows --force-webrtc-ip-handling-policy=disable_non_proxied_udp";
+
+/// 当前登录窗口的 CDP 端口。每次注册重新随机，求解器从这里取。
+static LOGIN_CDP_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// 取一个可用的高位 CDP 端口。
+///
+/// 避开 9222/9223 这类被风控写进黑名单的 Chromium 默认端口。绑定一次再释放
+/// 是「探测可用性」的常规做法，释放到 WebView2 真正绑定之间的窗口极窄，
+/// 抢不到就退回 0，由调用方按无端口处理。
+fn pick_cdp_port() -> u16 {
+    let seed = uuid::Uuid::new_v4().as_u128();
+    for i in 0..64u128 {
+        let port = (21000 + (seed.wrapping_add(i.wrapping_mul(9779)) % 20000)) as u16;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    0
+}
 
 static STORE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -207,13 +247,14 @@ async fn switch_to(app: AppHandle, id: String, force: bool, restart: bool) -> Re
 }
 
 #[tauri::command]
-async fn get_live_quota() -> Result<quota::QuotaOverview, String> {
-    store::live_quota(&Paths::detect())
+async fn get_live_quota(force: Option<bool>) -> Result<quota::QuotaOverview, String> {
+    store::live_quota(&Paths::detect(), force.unwrap_or(false))
 }
 
+/// 账号额度。`force=true` 跳过盘上快照（手动刷新、领取套餐后必须走这条）。
 #[tauri::command]
-async fn get_account_quota(id: String) -> Result<quota::QuotaOverview, String> {
-    store::account_quota(&Paths::detect(), &id)
+async fn get_account_quota(id: String, force: Option<bool>) -> Result<quota::QuotaOverview, String> {
+    store::account_quota(&Paths::detect(), &id, force.unwrap_or(false))
 }
 
 #[tauri::command]
@@ -440,9 +481,11 @@ async fn oauth_begin(
     }
     let assist_mode = driver::normalize_mode(mode.as_deref());
     let auto = batch.unwrap_or(false);
+    let mut proxy_str = String::new();
     let proxy_url: Option<tauri::Url> = match load_settings(&Paths::detect()).auth_proxy() {
         Some(p) => {
             let norm = oauth::parse_proxy_url(p)?;
+            proxy_str = norm.clone();
             Some(norm.parse::<tauri::Url>().map_err(|e| i18n::trf("err.proxy.invalid", &[("e", &e.to_string())]))?)
         }
         None => None,
@@ -454,6 +497,10 @@ async fn oauth_begin(
     let flow = uuid::Uuid::new_v4().to_string();
     flowlog::log(&flow, "begin", &format!("provider={provider} auto={auto} proxy={} client_ver={}", if proxy_url.is_some() { "on" } else { "off" }, quota::zcode_app_version()));
     let mid = uuid::Uuid::new_v4().to_string();
+    // 指纹档案的种子用 mid：它与最终写进账号的 `virtual_device_mid` 是同一个值，
+    // 「账号 ↔ 设备指纹」因此天然绑定，补注册 / 重登不会拿到另一套指纹。
+    let salt = Paths::detect().home.to_string_lossy().to_string();
+    let persona = persona::derive(&mid, &salt);
     let (p_init, m_init) = (provider.clone(), mid.clone());
     let init = match tauri::async_runtime::spawn_blocking(move || oauth::init_flow(&p_init, &m_init))
         .await
@@ -507,13 +554,41 @@ async fn oauth_begin(
     let app2 = app.clone();
     let (provider2, state2, flow2, mid2) = (provider.clone(), state.clone(), flow.clone(), mid.clone());
     let flow_close = flow.clone();
-    let driver_script = driver::bootstrap_script(&json!({
-        "mode": assist_mode,
-        "provider": provider,
-        "return_url": url,
-        "auto": auto,
-    }));
+    let driver_script = driver::bootstrap_script(
+        &json!({
+            "mode": assist_mode,
+            "provider": provider,
+            "return_url": url,
+            "auto": auto,
+        }),
+        &persona,
+    );
     let flow_driver = flow.clone();
+    // 登录窗口的 WebView2 参数：显式带 --proxy-server。
+    //
+    // Tauri 的 `builder.proxy_url()` 在「带独立 data_directory 的窗口」上实测**没生效**
+    // （实测：登录窗口出口 IP 与直连一致，而代理本身是好的）。
+    // 所以这里再走一遍命令行参数做双保险。
+    let cdp_port = pick_cdp_port();
+    LOGIN_CDP_PORT.store(cdp_port, std::sync::atomic::Ordering::Relaxed);
+    // 端口每次注册都不一样，不记下来就没法从外部挂上去排查（求解器是宿主自己传的，不受影响）。
+    flowlog::log(&flow, "cdp", &format!("port={cdp_port}"));
+    let cdp_arg = if cdp_port == 0 {
+        String::new()
+    } else {
+        format!(" --remote-debugging-port={cdp_port}")
+    };
+    let login_args = if proxy_str.is_empty() {
+        format!("{LOGIN_WEBVIEW_ARGS}{cdp_arg}")
+    } else {
+        format!("{LOGIN_WEBVIEW_ARGS}{cdp_arg} --proxy-server={proxy_str}")
+    };
+    // 窗口尺寸与位置由 persona 决定，不能固定：innerWidth/innerHeight/screenX/screenY
+    // 必须与伪 screen 尺寸自洽，否则「窗口比屏幕还大」一眼就是伪造。
+    let win_w = persona["win"]["w"].as_f64().unwrap_or(1120.0);
+    let win_h = persona["win"]["h"].as_f64().unwrap_or(820.0);
+    let win_x = persona["win"]["x"].as_f64().unwrap_or(0.0);
+    let win_y = persona["win"]["y"].as_f64().unwrap_or(0.0);
     let mut builder = tauri::WebviewWindowBuilder::new(
         &app,
         "login",
@@ -521,11 +596,18 @@ async fn oauth_begin(
     )
     .title(i18n::tr("title.login"))
     .theme(Some(tauri::Theme::Dark))
-    .inner_size(480.0, 680.0)
-    .min_inner_size(420.0, 560.0)
+    .inner_size(win_w, win_h)
+    .position(win_x, win_y)
+    .min_inner_size(840.0, 560.0)
     .resizable(true)
-    .user_agent(oauth::LOGIN_WINDOW_UA)
+    // 刻意不设 `.user_agent(...)`。
+    //
+    // 之前硬编码的是 Chrome/131 + Edg/131，而运行时 WebView2 已经是 155 ——
+    // `navigator.userAgent` 说 131、`navigator.userAgentData.brands` 说 155，
+    // 自相矛盾，比不伪装更容易被识别。UA 与 UA-CH 必须同源，
+    // 唯一稳的做法是交给运行时自己给。
     .initialization_script(&driver_script)
+    .additional_browser_args(&login_args)
     .data_directory(profile_dir);
     if let Some(u) = proxy_url {
         builder = builder.proxy_url(u);
@@ -592,10 +674,7 @@ async fn reg_input(app: AppHandle, ask: String, value: Value) -> Result<(), Stri
     let win = app
         .get_webview_window("login")
         .ok_or_else(|| i18n::tr("err.reg.no_window"))?;
-    let js = format!(
-        "window.__zpool && window.__zpool.fromHost({});",
-        json!({ "t": "input", "ask": ask, "value": value })
-    );
+    let js = driver::host_dispatch(&json!({ "t": "input", "ask": ask, "value": value }));
     win.eval(&js)
         .map_err(|e| i18n::trf("err.reg.eval", &[("e", &e.to_string())]))
 }
@@ -613,15 +692,41 @@ async fn reg_action(app: AppHandle, action: String) -> Result<(), String> {
             Ok(())
         }
         "retry" | "confirm-authorize" | "open-signup" => {
-            let js = format!(
-                "window.__zpool && window.__zpool.fromHost({});",
-                json!({ "t": "action", "action": action })
-            );
+            let js = driver::host_dispatch(&json!({ "t": "action", "action": action }));
             win.eval(&js)
                 .map_err(|e| i18n::trf("err.reg.eval", &[("e", &e.to_string())]))
         }
         other => Err(i18n::trf("err.reg.bad_action", &[("a", other)])),
     }
+}
+
+/// IMAP 自动寻址失败后的静默期：前端每 3 秒轮询一次，没有这个闸门会把整轮
+/// 探测（最坏几十秒）反复重跑。
+const IMAP_DISCOVER_COOLDOWN_MS: i64 = 60_000;
+static IMAP_FAIL_AT: Mutex<Vec<(String, i64)>> = Mutex::new(Vec::new());
+
+fn imap_cooldown_left(email: &str) -> Option<i64> {
+    let key = email.trim().to_ascii_lowercase();
+    let now = chrono::Local::now().timestamp_millis();
+    let list = IMAP_FAIL_AT.lock().unwrap_or_else(|e| e.into_inner());
+    list.iter().find(|(e, _)| *e == key).and_then(|(_, at)| {
+        let left = IMAP_DISCOVER_COOLDOWN_MS - (now - at);
+        (left > 0).then_some(left)
+    })
+}
+
+fn mark_imap_fail(email: &str) {
+    let key = email.trim().to_ascii_lowercase();
+    let now = chrono::Local::now().timestamp_millis();
+    let mut list = IMAP_FAIL_AT.lock().unwrap_or_else(|e| e.into_inner());
+    list.retain(|(e, _)| *e != key);
+    list.push((key, now));
+}
+
+fn clear_imap_fail(email: &str) {
+    let key = email.trim().to_ascii_lowercase();
+    let mut list = IMAP_FAIL_AT.lock().unwrap_or_else(|e| e.into_inner());
+    list.retain(|(e, _)| *e != key);
 }
 
 #[tauri::command]
@@ -631,32 +736,70 @@ async fn reg_fetch_link(
     since: Option<i64>,
 ) -> Result<Value, String> {
     let root = Paths::detect().store_dir();
-    let mut accounts = pool::load(&root);
-    let acc = pool::find(&accounts, &email)
-        .ok_or_else(|| i18n::trf("err.pool.not_found", &[("email", email.trim())]))?
-        .clone();
+    let (acc, acc_zone) = pool::find_any(&root, &email)
+        .ok_or_else(|| i18n::trf("err.pool.not_found", &[("email", email.trim())]))?;
     let cur_flow = pending_oauth_guard()
         .as_ref()
         .map(|p| p.flow.clone())
         .unwrap_or_default();
-    let (found, new_rt) = match graph::fetch_links(
-        &acc.client_id,
-        &acc.refresh_token,
-        limit.unwrap_or(12),
-        since,
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            if !cur_flow.is_empty() {
-                let short: String = e.chars().take(200).collect();
-                flowlog::log(&cur_flow, "link-fetch-fail", &short);
+    let take = limit.unwrap_or(12);
+
+    let (found, new_rt, new_ep) = if acc.is_outlook() {
+        match graph::fetch_links(&acc.client_id, &acc.refresh_token, take, since) {
+            Ok((f, rt)) => (f, rt, None),
+            Err(e) => {
+                if !cur_flow.is_empty() {
+                    flowlog::log(&cur_flow, "link-fetch-fail", &e.chars().take(200).collect::<String>());
+                }
+                if graph::is_credential_error(&e) {
+                    let _ = pool::set_status(
+                        &root,
+                        &email,
+                        pool::STATUS_INVALID,
+                        Some(i18n::tr("err.graph.reauth")),
+                    );
+                }
+                return Err(e);
             }
-            if graph::is_credential_error(&e) {
-                let _ = pool::set_status(&root, &email, pool::STATUS_INVALID, Some(i18n::tr("err.graph.reauth")));
+        }
+    } else {
+        if acc.password.trim().is_empty() {
+            return Err(i18n::trf("err.imap.no_password", &[("email", acc.email.trim())]));
+        }
+        if let Some(left) = imap_cooldown_left(&acc.email) {
+            return Err(i18n::trf("err.imap.cooling", &[("sec", &((left / 1000) + 1).to_string())]));
+        }
+        let (mail_addr, password, cached) = (acc.email.clone(), acc.password.clone(), acc.endpoint());
+        let res = tauri::async_runtime::spawn_blocking(
+            move || -> Result<(graph::Found, Option<imap::Endpoint>), String> {
+                let (ep, fresh) = match cached {
+                    Some(ep) => (ep, None),
+                    None => {
+                        let ep = imap::discover(&mail_addr, &password)?;
+                        (ep.clone(), Some(ep))
+                    }
+                };
+                let found = imap::fetch_links(&ep, &password, take, since)?;
+                Ok((found, fresh))
+            },
+        )
+        .await
+        .map_err(|e| i18n::trf("err.imap.spawn", &[("e", &e.to_string())]))?;
+        match res {
+            Ok((f, fresh)) => {
+                clear_imap_fail(&acc.email);
+                (f, None, fresh)
             }
-            return Err(e);
+            Err(e) => {
+                if !cur_flow.is_empty() {
+                    flowlog::log(&cur_flow, "imap-fetch-fail", &e.chars().take(200).collect::<String>());
+                }
+                mark_imap_fail(&acc.email);
+                return Err(e);
+            }
         }
     };
+
     if !cur_flow.is_empty() {
         let newest: String = found
             .newest_subject
@@ -675,12 +818,21 @@ async fn reg_fetch_link(
             ),
         );
     }
-    if let Some(rt) = new_rt {
+
+    // 回写：Graph 会轮换 refresh_token；IMAP 首次探测到的端点就地缓存，后续注册不再重探。
+    if new_rt.is_some() || new_ep.is_some() {
+        let mut accounts = pool::load_zone(&root, acc_zone);
         if let Some(a) = pool::find_mut(&mut accounts, &email) {
-            a.refresh_token = rt;
-            let _ = pool::save(&root, &accounts);
+            if let Some(rt) = new_rt {
+                a.refresh_token = rt;
+            }
+            if let Some(ep) = new_ep.as_ref() {
+                a.set_endpoint(ep);
+            }
+            let _ = pool::save_zone(&root, acc_zone, &accounts);
         }
     }
+
     Ok(json!({
         "links": found.links,
         "scanned": found.scanned,
@@ -689,11 +841,190 @@ async fn reg_fetch_link(
     }))
 }
 
+/// 自动完成注册表单上的滑块验证码。
+///
+/// 由前端在 driver 报告「验证码挡着」时调用；求解成功后页面自身会显示
+/// 「验证通过」，driver 的门控随即放行并提交，不需要回传 token。
+#[tauri::command]
+async fn captcha_solve() -> Result<Value, String> {
+    let store = Paths::detect().store_dir();
+    let port = LOGIN_CDP_PORT.load(std::sync::atomic::Ordering::Relaxed);
+    let r = tauri::async_runtime::spawn_blocking(move || captcha::solve(&store, port))
+        .await
+        .map_err(|e| i18n::trf("err.captcha.spawn", &[("e", &e.to_string())]))?;
+    match &r {
+        Ok(v) => {
+            let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
+            flowlog::log(
+                "captcha",
+                if ok { "solved" } else { "unsolved" },
+                &v.to_string().chars().take(300).collect::<String>(),
+            );
+        }
+        Err(e) => flowlog::log("captcha", "error", &e.chars().take(300).collect::<String>()),
+    }
+    r
+}
+
+/// 注册前的邮箱预检：连不上或读不了收件箱就提前判失败。
+///
+/// 顺序上放在注册之前——不然白开一次登录窗口、白过一次验证码，最后才发现邮箱是死的。
+/// 顺带把探测到的 IMAP 端点缓存回账号，后面取激活链接不用再探一遍。
+#[tauri::command]
+async fn mail_precheck(email: String) -> Result<Value, String> {
+    let root = Paths::detect().store_dir();
+    let (acc, zone) = pool::find_any(&root, &email)
+        .ok_or_else(|| i18n::trf("err.pool.not_found", &[("email", email.trim())]))?;
+
+    if acc.is_outlook() {
+        // Outlook 走 Graph，凭据问题会在取信那步报出来，这里不额外校验
+        return Ok(json!({ "ok": true, "kind": "outlook" }));
+    }
+    // 域名被上游拒收的（一次性邮箱等）不用再往下走
+    if let Some(dom) = pool::domain_blocked(&root, &acc.email) {
+        flowlog::log("precheck", "blocked", &format!("{} 域名 {dom} 不可注册", acc.email));
+        return Ok(json!({
+            "ok": false,
+            "blocked": true,
+            "domain": dom,
+            "error": i18n::trf("err.mail.domain_blocked", &[("domain", &dom)]),
+        }));
+    }
+    if acc.password.trim().is_empty() {
+        return Err(i18n::trf("err.imap.no_password", &[("email", acc.email.trim())]));
+    }
+
+    let (addr, password, cached) = (acc.email.clone(), acc.password.clone(), acc.endpoint());
+    let res = tauri::async_runtime::spawn_blocking(
+        move || -> Result<(imap::Endpoint, usize), String> {
+            imap::probe(&addr, &password, cached.as_ref())
+        },
+    )
+    .await
+    .map_err(|e| i18n::trf("err.imap.spawn", &[("e", &e.to_string())]))?;
+
+    match res {
+        Ok((ep, count)) => {
+            let mut accounts = pool::load_zone(&root, zone);
+            if let Some(a) = pool::find_mut(&mut accounts, &email) {
+                a.set_endpoint(&ep);
+                let _ = pool::save_zone(&root, zone, &accounts);
+            }
+            flowlog::log(
+                "precheck",
+                "ok",
+                &format!("{email} -> {}:{} inbox={count}", ep.host, ep.port),
+            );
+            Ok(json!({
+                "ok": true,
+                "kind": "imap",
+                "host": ep.host,
+                "port": ep.port,
+                "messages": count,
+            }))
+        }
+        Err(e) => {
+            flowlog::log(
+                "precheck",
+                "fail",
+                &format!("{email}: {}", e.chars().take(200).collect::<String>()),
+            );
+            Ok(json!({ "ok": false, "error": e }))
+        }
+    }
+}
+
+/// 域名黑名单：内置 + 用户自定义，预检阶段直接拦掉。
+#[tauri::command]
+async fn blocked_list() -> Result<Value, String> {
+    let root = Paths::detect().store_dir();
+    Ok(json!({
+        "builtin": pool::blocked_builtin(),
+        "custom": pool::blocked_custom(&root),
+    }))
+}
+
+#[tauri::command]
+async fn blocked_add(domain: String) -> Result<Value, String> {
+    let root = Paths::detect().store_dir();
+    let d = pool::blocked_add(&root, &domain)?;
+    Ok(json!({ "ok": true, "domain": d, "custom": pool::blocked_custom(&root) }))
+}
+
+#[tauri::command]
+async fn blocked_remove(domain: String) -> Result<Value, String> {
+    let root = Paths::detect().store_dir();
+    pool::blocked_remove(&root, &domain)?;
+    Ok(json!({ "ok": true, "custom": pool::blocked_custom(&root) }))
+}
+
 #[tauri::command]
 async fn pool_list() -> Result<Value, String> {
     let root = Paths::detect().store_dir();
     let items: Vec<_> = pool::load(&root).iter().map(|a| a.to_summary()).collect();
     Ok(json!({ "accounts": items }))
+}
+
+/// 待注册账号：独立于邮箱库的一份列表，注册流程从这里取号。
+#[tauri::command]
+async fn pending_list() -> Result<Value, String> {
+    let root = Paths::detect().store_dir();
+    let items: Vec<_> = pool::load_zone(&root, pool::ZONE_PENDING)
+        .iter()
+        .map(|a| a.to_summary())
+        .collect();
+    Ok(json!({ "accounts": items }))
+}
+
+#[tauri::command]
+async fn pending_remove(app: AppHandle, email: String) -> Result<Value, String> {
+    let removed = {
+        let _guard = store_guard();
+        let root = Paths::detect().store_dir();
+        let mut accounts = pool::load_zone(&root, pool::ZONE_PENDING);
+        let before = accounts.len();
+        accounts.retain(|a| !a.email.eq_ignore_ascii_case(email.trim()));
+        let removed = before - accounts.len();
+        pool::save_zone(&root, pool::ZONE_PENDING, &accounts)?;
+        removed
+    };
+    let _ = app.emit("pool-changed", ());
+    Ok(json!({ "removed": removed }))
+}
+
+#[tauri::command]
+async fn pending_remove_many(app: AppHandle, emails: Vec<String>) -> Result<Value, String> {
+    let removed = {
+        let _guard = store_guard();
+        let root = Paths::detect().store_dir();
+        let mut accounts = pool::load_zone(&root, pool::ZONE_PENDING);
+        let before = accounts.len();
+        let targets: Vec<String> = emails.iter().map(|e| e.trim().to_ascii_lowercase()).collect();
+        accounts.retain(|a| !targets.contains(&a.email.trim().to_ascii_lowercase()));
+        let removed = before - accounts.len();
+        pool::save_zone(&root, pool::ZONE_PENDING, &accounts)?;
+        removed
+    };
+    let _ = app.emit("pool-changed", ());
+    Ok(json!({ "removed": removed }))
+}
+
+/// 粘贴导入：多行文本，按与文件导入完全相同的规则自动分流。
+#[tauri::command]
+async fn pool_import_text(app: AppHandle, text: String) -> Result<Value, String> {
+    let r = {
+        let _guard = store_guard();
+        let root = Paths::detect().store_dir();
+        pool::import_split(&root, &text, &store::now_ts())?
+    };
+    let _ = app.emit("pool-changed", ());
+    Ok(json!({
+        "added": r.added,
+        "skipped": r.skipped,
+        "parsed": r.total_parsed,
+        "pendingAdded": r.pending_added,
+        "mailAdded": r.mail_added,
+    }))
 }
 
 #[tauri::command]
@@ -714,18 +1045,23 @@ async fn pool_import_pick(app: AppHandle) -> Result<Value, String> {
 
     let _guard = store_guard();
     let root = Paths::detect().store_dir();
-    let mut accounts = pool::load(&root);
-    let r = pool::import(&mut accounts, &raw, store::now_ts());
-    pool::save(&root, &accounts)?;
+    let r = pool::import_split(&root, &raw, &store::now_ts())?;
     drop(_guard);
 
-    let items: Vec<_> = accounts.iter().map(|a| a.to_summary()).collect();
+    let items: Vec<_> = pool::load(&root).iter().map(|a| a.to_summary()).collect();
+    let pending: Vec<_> = pool::load_zone(&root, pool::ZONE_PENDING)
+        .iter()
+        .map(|a| a.to_summary())
+        .collect();
     Ok(json!({
         "picked": true,
         "added": r.added,
         "skipped": r.skipped,
         "parsed": r.total_parsed,
+        "pendingAdded": r.pending_added,
+        "mailAdded": r.mail_added,
         "accounts": items,
+        "pendingAccounts": pending,
     }))
 }
 
@@ -757,10 +1093,9 @@ async fn pool_remove_many(emails: Vec<String>) -> Result<Value, String> {
 #[tauri::command]
 async fn pool_get(email: String) -> Result<Value, String> {
     let root = Paths::detect().store_dir();
-    let accounts = pool::load(&root);
-    let a = pool::find(&accounts, &email)
+    let (a, zone) = pool::find_any(&root, &email)
         .ok_or_else(|| i18n::trf("err.pool.not_found", &[("email", email.trim())]))?;
-    Ok(json!({ "email": a.email, "password": a.password }))
+    Ok(json!({ "email": a.email, "password": a.password, "zone": zone }))
 }
 
 #[tauri::command]
@@ -773,17 +1108,10 @@ async fn pool_mark_verified(
     {
         let _guard = store_guard();
         let root = Paths::detect().store_dir();
-        let mut accounts = pool::load(&root);
-        if let Some(a) = pool::find_mut(&mut accounts, &email) {
-            if ok {
-                a.status = pool::STATUS_VERIFIED.to_string();
-                a.verified_at = Some(store::now_ts());
-                a.note = None;
-            } else {
-                a.status = pool::STATUS_FAILED.to_string();
-                a.note = note;
-            }
-            pool::save(&root, &accounts)?;
+        if ok {
+            pool::set_status_any(&root, &email, pool::STATUS_VERIFIED, None)?;
+        } else {
+            pool::set_status_any(&root, &email, pool::STATUS_FAILED, note)?;
         }
     }
     let _ = app.emit("pool-changed", ());
@@ -803,7 +1131,7 @@ async fn pool_reset(app: AppHandle, email: String) -> Result<(), String> {
     {
         let _guard = store_guard();
         let root = Paths::detect().store_dir();
-        pool::set_status(&root, &email, pool::STATUS_NEW, None)?;
+        pool::set_status_any(&root, &email, pool::STATUS_NEW, None)?;
     }
     let _ = app.emit("pool-changed", ());
     Ok(())
@@ -811,36 +1139,36 @@ async fn pool_reset(app: AppHandle, email: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn pool_upsert(app: AppHandle, line: String) -> Result<Value, String> {
-    let Some((email, password, client_id, refresh_token)) = pool::parse_lines(&line).into_iter().next() else {
+    let Some(parsed) = pool::parse_line(&line, &store::now_ts()) else {
         return Err(i18n::tr("err.pool.bad_line"));
+    };
+    // 与导入同样的分流规则：通用邮箱进待注册区，Outlook 进邮箱库。
+    let zone = if parsed.is_outlook() {
+        pool::ZONE_MAIL
+    } else {
+        pool::ZONE_PENDING
     };
     let _guard = store_guard();
     let root = Paths::detect().store_dir();
-    let mut accounts = pool::load(&root);
-    let updated = if let Some(a) = pool::find_mut(&mut accounts, &email) {
-        a.password = password;
-        a.client_id = client_id;
-        a.refresh_token = refresh_token;
+    let mut accounts = pool::load_zone(&root, zone);
+    let updated = if let Some(a) = pool::find_mut(&mut accounts, &parsed.email) {
+        a.password = parsed.password.clone();
+        a.client_id = parsed.client_id.clone();
+        a.refresh_token = parsed.refresh_token.clone();
+        a.imap_host = parsed.imap_host.clone();
+        a.imap_port = parsed.imap_port;
+        a.imap_user = None;
         a.status = pool::STATUS_NEW.to_string();
         a.note = None;
         true
     } else {
-        accounts.push(pool::MailAccount {
-            email: email.clone(),
-            password,
-            client_id,
-            refresh_token,
-            status: pool::STATUS_NEW.to_string(),
-            verified_at: None,
-            note: None,
-            created_at: store::now_ts(),
-        });
+        accounts.push(parsed.clone());
         false
     };
-    pool::save(&root, &accounts)?;
+    pool::save_zone(&root, zone, &accounts)?;
     drop(_guard);
     let _ = app.emit("pool-changed", ());
-    Ok(json!({ "email": email, "updated": updated }))
+    Ok(json!({ "email": parsed.email, "updated": updated, "zone": zone }))
 }
 
 #[tauri::command]
@@ -902,10 +1230,7 @@ async fn reg_set_mode(app: AppHandle, mode: String) -> Result<String, String> {
     let win = app
         .get_webview_window("login")
         .ok_or_else(|| i18n::tr("err.reg.no_window"))?;
-    let js = format!(
-        "window.__zpool && window.__zpool.fromHost({});",
-        json!({ "t": "setMode", "mode": m })
-    );
+    let js = driver::host_dispatch(&json!({ "t": "setMode", "mode": m }));
     win.eval(&js)
         .map_err(|e| i18n::trf("err.reg.eval", &[("e", &e.to_string())]))?;
     Ok(m)
@@ -951,6 +1276,8 @@ async fn finish_oauth(app: &AppHandle, provider: String, state: String, flow: St
         let flow = flow.clone();
         let mid = mid.clone();
         let callback_url = callback_url.to_string();
+        // 绑定邀请码要在注册窗口还活着的时候做，所以连窗口句柄一起带进闭包。
+        let app_invite = app.clone();
         tauri::async_runtime::spawn_blocking(move || -> Result<serde_json::Value, String> {
             {
                 let pending = pending_oauth_guard();
@@ -991,6 +1318,8 @@ async fn finish_oauth(app: &AppHandle, provider: String, state: String, flow: St
                         "persist-ok",
                         &format!("channel=deeplink duplicate={}", v.get("duplicate").is_some()),
                     );
+                    // 账号已入库 → 顺手把邀请码绑上（不是必须项，失败只留痕）。
+                    finish_invite(&app_invite, &exchanged["raw"], &flow);
                     Ok(v)
                 }
                 Err(e) => {
@@ -1019,6 +1348,209 @@ async fn finish_oauth(app: &AppHandle, provider: String, state: String, flow: St
 
 fn deeplink_err_soft(e: &str) -> bool {
     e != "__superseded__" && e != "__attribution__"
+}
+
+/// 内置邀请码。settings 里填了就用 settings 的。
+const DEFAULT_INVITE_CODE: &str = "MK45MPKN";
+/// 邀请页所在域。注册窗口收尾时正好停在这里（`/api/v1/oauth/cli/callback/...`）。
+const INVITE_HOST: &str = "zcode.z.ai";
+/// 等窗口自己落到 zcode.z.ai 的时限。poll 可能比桥接页先 ready，
+/// 这时窗口还在跳转中间，必须等而不是抢着导航。
+const INVITE_HOST_WAIT_MS: u64 = 15_000;
+/// 等邀请页跳成功页的时限。实测整条自动绑定（无感验证码 + bind-code）约 3~6 秒；
+/// 留够 SDK 加载与重试的余量即可 —— 批量注册时它是每个号唯一会等的一步。
+const INVITE_BOUND_WAIT_MS: u64 = 40_000;
+
+/// 同一时刻只允许一个绑定在跑：poll 与 deeplink 两条完成通道都可能走到这里。
+static INVITE_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn invite_code() -> String {
+    load_settings(&Paths::detect())
+        .invite_code
+        .map(|c| c.trim().to_ascii_uppercase())
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(|| DEFAULT_INVITE_CODE.to_string())
+}
+
+/// 邀请码是 8 位、去掉了 0/1/I/O 这类易混字符的大写串（与前端 `mz()` 的校验一致）。
+fn valid_invite_code(c: &str) -> bool {
+    c.chars().count() == 8 && c.chars().all(|ch| "23456789ABCDEFGHJKLMNPQRSTUVWXYZ".contains(ch))
+}
+
+/// 注册/登录收尾时顺手把邀请码绑上。
+///
+/// 宿主只做三件事：把 zcode 网页 token 写进注册窗口的 localStorage、写一份
+/// 10 分钟内有效的一次性意图（`acceptIntent` 的 nonce 必须对得上）、导航到邀请页。
+/// 剩下的——无感验证码、`bind-code`、跳成功页——全由 zcode 前端自己跑完，
+/// 这条链路是实测走通的，这里不重造一遍。
+///
+/// **失败不算注册失败**：调用方只记日志、发事件；账号这时早就入库了。
+fn bind_invite_code(app: &AppHandle, jwt: &str, flow: &str) -> Result<String, String> {
+    let code = invite_code();
+    if !valid_invite_code(&code) {
+        return Err(i18n::trf("err.invite.bad_code", &[("code", &code)]));
+    }
+    let jwt = jwt.trim();
+    if jwt.is_empty() {
+        return Err(i18n::tr("err.invite.no_token"));
+    }
+    if INVITE_BUSY.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Err(i18n::tr("err.invite.busy"));
+    }
+    let _busy = BusyFlag;
+
+    let win = app
+        .get_webview_window("login")
+        .ok_or_else(|| i18n::tr("err.invite.no_window"))?;
+    let host_now = || -> String {
+        win.url()
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .unwrap_or_default()
+    };
+    let wait_host = || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(INVITE_HOST_WAIT_MS);
+        while std::time::Instant::now() < deadline && host_now() != INVITE_HOST {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+    };
+
+    if host_now() != INVITE_HOST {
+        wait_host();
+    }
+    if host_now() != INVITE_HOST {
+        // 窗口没自己过来（或还停在 chat.z.ai）：直接导到邀请页。
+        // 邀请页只认 origin，从哪个入口进来都行；token 是下一步才写的，
+        // 所以这一趟先把页面落地，避免带着 intent 空跑一次。
+        let js = format!("location.href = 'https://{INVITE_HOST}/cn/invite/{code}';");
+        win.eval(&js)
+            .map_err(|e| i18n::trf("err.reg.eval", &[("e", &e.to_string())]))?;
+        wait_host();
+    }
+    if host_now() != INVITE_HOST {
+        return Err(i18n::tr("err.invite.no_origin"));
+    }
+
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let j = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string());
+    let js = format!(
+        "(function(){{try{{\
+         localStorage.setItem(\"zcodejwttoken\", {jwt});\
+         sessionStorage.setItem(\"incentive:accept-intent\", JSON.stringify({{code:{code}, nonce:{nonce}, createdAt:Date.now()}}));\
+         location.href = \"/cn/invite/\" + encodeURIComponent({code}) + \"?acceptIntent=\" + encodeURIComponent({nonce});\
+         }}catch(e){{}}}})();",
+        jwt = j(jwt),
+        code = j(&code),
+        nonce = j(&nonce),
+    );
+    win.eval(&js)
+        .map_err(|e| i18n::trf("err.reg.eval", &[("e", &e.to_string())]))?;
+    flowlog::log(flow, "invite-nav", &format!("code={code}"));
+
+    // 成功后是 Next.js 客户端路由（不刷新页面），所以盯 URL 就够。
+    //
+    // 但 URL 是**弱信号**：重复登录同一个号时，邀请页走的是「你已接受邀请」
+    // 分支，永远不跳成功页。所以隔几秒补一次服务端复核，别把「已绑定」
+    // 误报成失败 —— 那会让批量日志看起来像功能坏了。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(INVITE_BOUND_WAIT_MS);
+    let mut last_probe = std::time::Instant::now();
+    loop {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let hit = win
+            .url()
+            .map(|u| u.path().contains("/invite/success"))
+            .unwrap_or(false);
+        if hit {
+            return Ok(code);
+        }
+        if last_probe.elapsed() >= std::time::Duration::from_secs(6) {
+            last_probe = std::time::Instant::now();
+            if invite_bound_confirmed(jwt) {
+                return Ok(code);
+            }
+        }
+    }
+    if invite_bound_confirmed(jwt) {
+        return Ok(code);
+    }
+    Err(i18n::tr("err.invite.timeout"))
+}
+
+/// 服务端复核：`referral/summary` 里那条 `referral_bind_code` 新手任务。
+///
+/// 这是绑定的权威状态，页面跳不跳成功页都不影响它。请求失败一律当「没绑上」，
+/// 继续走原来的超时逻辑 —— 复核只是加分项，不该让判定更糟。
+fn invite_bound_confirmed(jwt: &str) -> bool {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .build();
+    let resp = match agent
+        .get("https://zcode.z.ai/api/v1/incentive/referral/summary")
+        .set("Accept", "application/json")
+        .set("Authorization", &format!("Bearer {jwt}"))
+        .call()
+    {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let body = resp.into_string().unwrap_or_default();
+    let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    v.pointer("/data/invitee/tasks")
+        .and_then(|t| t.as_array())
+        .map(|tasks| {
+            tasks.iter().any(|t| {
+                t.get("key").and_then(|k| k.as_str()) == Some("referral_bind_code")
+                    && t.get("completed").and_then(|c| c.as_bool()) == Some(true)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// `INVITE_BUSY` 的 RAII 释放：函数里有多条提前 return 的分支。
+struct BusyFlag;
+
+impl Drop for BusyFlag {
+    fn drop(&mut self) {
+        INVITE_BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 绑定收尾：拿 jwt → 绑 → 上报。**永远不返回 Err** —— 它不该影响注册结果。
+fn finish_invite(app: &AppHandle, raw: &Value, flow: &str) {
+    let jwt = raw
+        .pointer("/data/token")
+        .and_then(|t| t.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let _ = app.emit("reg://event", json!({ "kind": "phase", "phase": "bind-invite" }));
+    let _ = app.emit(
+        "reg://event",
+        json!({ "kind": "log", "level": "info", "code": "inviteStart", "a": invite_code() }),
+    );
+    match bind_invite_code(app, &jwt, flow) {
+        Ok(code) => {
+            flowlog::log(flow, "invite-bound", &format!("code={code}"));
+            let _ = app.emit(
+                "reg://event",
+                json!({ "kind": "log", "level": "ok", "code": "inviteBound", "a": code }),
+            );
+        }
+        Err(e) => {
+            // 绑定不是必须项：注册已经成功，这里只留痕。
+            flowlog::log(flow, "invite-skip", &e);
+            let _ = app.emit(
+                "reg://event",
+                json!({ "kind": "log", "level": "warn", "code": "inviteFail", "a": e }),
+            );
+        }
+    }
+    // 绑定阶段结束（无论成败）才把流程标成完成 —— driver 早前发过一次
+    // `done`，那次是「授权完成」，随后就被 `bind-invite` 覆盖了。
+    let _ = app.emit("reg://event", json!({ "kind": "phase", "phase": "done" }));
 }
 
 fn persist_oauth_account(
@@ -1191,6 +1723,11 @@ fn spawn_poll_loop(app: AppHandle, provider: String, flow: String, mid: String, 
                             flowlog::log(&flow, "persist-fail", &format!("channel=poll {e}"));
                         }
                         Err(_) => {}
+                    }
+                    // 账号已入库 → 顺手把邀请码绑上（不是必须项，失败只留痕）。
+                    // 必须赶在 finalize 关窗之前，绑定要用这个窗口。
+                    if result.is_ok() {
+                        finish_invite(&app, &raw, &flow);
                     }
                     finalize_oauth_result(&app, result);
                     return;
@@ -1593,8 +2130,17 @@ pub fn run() {
             reg_set_mode,
             reg_close_window,
             reg_fetch_link,
+            mail_precheck,
+            captcha_solve,
             pool_list,
+            pending_list,
+            pending_remove,
+            pending_remove_many,
+            blocked_list,
+            blocked_add,
+            blocked_remove,
             pool_import_pick,
+            pool_import_text,
             pool_remove,
             pool_remove_many,
             pool_get,

@@ -12,6 +12,13 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+# Tauri 2 靠这个 feature 区分「开发」和「发布」：`tauri-2.x/build.rs` 里
+# `let dev = !has_feature("custom-protocol")`。缺了它，连 --release 构建也会
+# 按 dev 模式把 devUrl（http://127.0.0.1:5173）嵌进二进制，双击就是
+# ERR_CONNECTION_REFUSED。`tauri build` 会自动带上，直接用 cargo 时必须手动指定。
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
@@ -28,6 +35,9 @@ pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 ureq = { version = "2", features = ["json"] }
 tiny_http = "0.12"
 sys-locale = "0.3"
+imap = "2"
+native-tls = "0.2"
+mailparse = "0.15"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = [

@@ -127,7 +127,7 @@ export function openLineModal(m) {
       <div class="mbody">
         <div class="mnote" style="margin-bottom:12px">${esc(m.hint || "")}</div>
         <label class="fld"><span>${esc(m.label || "")}</span>
-          <textarea class="inp" rows="3" placeholder="${esc(m.placeholder || "")}" spellcheck="false"></textarea></label>
+          <textarea class="inp" rows="${m.rows || 3}" placeholder="${esc(m.placeholder || "")}" spellcheck="false"></textarea></label>
         <div class="errline"></div>
       </div>
       <div class="mfoot">

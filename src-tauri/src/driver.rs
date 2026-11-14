@@ -1,6 +1,31 @@
 use serde_json::{json, Map, Value};
+use std::path::Path;
 
 pub const DRIVER_JS: &str = include_str!("driver/zpool-driver.js");
+pub const FP_JS: &str = include_str!("../assets/zpool-fp.js");
+
+/// 开发态优先读磁盘，这样改脚本不用重编 Rust；内嵌版本在分发的 exe 里兜底。
+fn load_js(embedded: &str, rel: &str) -> String {
+    if let Ok(dir) = std::env::var("ZPOOL_DRIVER_DIR") {
+        let p = std::path::Path::new(&dir).join(Path::new(rel).file_name().unwrap_or_default());
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            return s;
+        }
+    }
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+    if let Ok(s) = std::fs::read_to_string(&src) {
+        return s;
+    }
+    embedded.to_string()
+}
+
+fn driver_js() -> String {
+    load_js(DRIVER_JS, "src/driver/zpool-driver.js")
+}
+
+fn fp_js() -> String {
+    load_js(FP_JS, "assets/zpool-fp.js")
+}
 
 pub const SENTINEL_SCHEME: &str = "zpool-driver";
 const SENTINEL_PREFIX: &str = "zpool-driver://msg";
@@ -28,9 +53,35 @@ pub fn normalize_mode(mode: Option<&str>) -> String {
     }
 }
 
-pub fn bootstrap_script(cfg: &Value) -> String {
-    let json = serde_json::to_string(cfg).unwrap_or_else(|_| "{}".to_string());
-    format!("window.__ZPOOL_CFG = {json};\n{DRIVER_JS}\n")
+/// 组装注入脚本。
+///
+/// **`CFG` / `PERSONA` 是 IIFE 的局部变量，不再挂到 `window` 上。**
+/// 之前是 `window.__ZPOOL_CFG` + `window.__zpool`，两者都可枚举 ——
+/// 页面跑一行 `Object.keys(window)` 就能看到 `__ZPOOL_CFG`，
+/// 等于把「这是一个叫 zpool 的自动化工具」写在脸上。
+///
+/// 宿主 → 页面的指令改走 `document.dispatchEvent(new CustomEvent(...))`：
+/// 事件监听器无法从页面侧枚举，比任何全局变量都隐蔽。
+pub fn bootstrap_script(cfg: &Value, persona: &Value) -> String {
+    let cfg_json = serde_json::to_string(cfg).unwrap_or_else(|_| "{}".to_string());
+    let persona_json = serde_json::to_string(persona).unwrap_or_else(|_| "{}".to_string());
+    format!(
+        "(function(){{\nvar CFG = {cfg_json};\nvar PERSONA = {persona_json};\n{}{}\n}})();\n",
+        fp_js(),
+        driver_js()
+    )
+}
+
+/// 宿主 → 页面的指令事件名。与 `zpool-driver.js` 里的监听保持一致。
+pub const HOST_EVENT: &str = "zpool:host";
+
+/// 构造一条宿主指令的派发语句。
+pub fn host_dispatch(payload: &Value) -> String {
+    format!(
+        "document.dispatchEvent(new CustomEvent({}, {{ detail: {} }}));",
+        serde_json::to_string(HOST_EVENT).unwrap_or_else(|_| "\"zpool:host\"".to_string()),
+        serde_json::to_string(payload).unwrap_or_else(|_| "null".to_string())
+    )
 }
 
 pub fn parse_message(url: &str) -> Option<Value> {
